@@ -21,7 +21,7 @@ class TestSample extends BaseModel
     protected $fillable = [
         'id',
         'barcode',
-        'sl_no',
+        // REMOVED: 'sl_no' — column dropped (receipt-level sl_no lives on lab_receipts and is kept)
         'tenant_id',
         'lab_receipt_id',
         'patient_id',

@@ -24,8 +24,8 @@ class TestSampleItem extends BaseModel
         'collected_by',
         'collected_at',
         'notes',
-        'suffix',
-        'sample_number',
+        'suffix',           // KEPT — needed (tube identity; column stays on test_sample_items)
+        // REMOVED: 'sample_number' — column dropped (derive from testSample.tube_sequence)
         'status',
     ];
 

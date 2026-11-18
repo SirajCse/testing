@@ -286,15 +286,14 @@ class MirthController extends Controller
             'worklist' => $worklists->map(function ($worklist) {
                 return [
                     'worklist_id' => $worklist->id,
-                    'order_id' => $worklist->order_id,
 
                     // barcode IS the tube barcode
                     'barcode' => $worklist->barcode,
                     'receipt_barcode' => $worklist->receipt_barcode,
 
                     // Tube metadata
-                    'sample_number' => $worklist->sample_number,
-                    'suffix' => $worklist->suffix,
+                    // REMOVED: 'sample_number' — column dropped; Mirth derives it from tube_sequence
+                    'suffix' => $worklist->suffix,   // KEPT (needed)
                     'tube_type' => $worklist->tube_type,
                     'timing' => $worklist->timing,
                     'sample_type' => $worklist->sample_type,
@@ -302,6 +301,9 @@ class MirthController extends Controller
                     // Test metadata
                     'test_code' => $worklist->test_code,
                     'test_name' => $worklist->test_name,
+
+                    // Machine mapping — NEW (was inside parameters JSON)
+                    'machine_mapping_id' => $worklist->machine_mapping_id,
 
                     // Priority & status
                     'priority' => $worklist->priority,
@@ -314,11 +316,8 @@ class MirthController extends Controller
                     'patient_gender' => $worklist->patient_gender,
 
                     // Dates
-                    'order_date' => $worklist->order_date?->toISOString(),
                     'collection_date' => $worklist->collection_date?->toISOString(),
-
-                    // Full machine mapping
-                    'parameters' => $worklist->parameters,
+                    // REMOVED: 'order_date' and 'parameters' (columns dropped)
                 ];
             }),
         ]);
@@ -507,13 +506,12 @@ class MirthController extends Controller
             }
 
             if (! $worklist) {
-                // 🟢 GLUE-aware lookup: barcode + test_code + machine + suffix + sample_number
+                // GLUE-aware lookup: barcode + test_code + machine + suffix
+                // REMOVED: sample_number filter — worklists.sample_number column is dropped
                 $worklist = Worklist::where('barcode', $request->barcode)
                     ->where('test_code', $request->test_code)
                     ->where('machine_id', $machine->id)
                     ->whereIn('status', ['pending', 'processing'])
-                    ->when($request->filled('sample_number'), fn ($q) => $q->where('sample_number', $request->sample_number)
-                    )
                     ->when($request->filled('suffix'), fn ($q) => $q->where('suffix', $request->suffix)
                     )
                     ->orderBy('created_at', 'asc')
@@ -540,12 +538,9 @@ class MirthController extends Controller
             if ($worklist) {
                 $worklist->status = 'completed';
                 $worklist->completed_at = now();
-                $worklist->result_data = array_merge($worklist->result_data ?? [], [
-                    'result_value' => $request->result_value,
-                    'unit' => $request->unit,
-                    'abnormal_flag' => $request->abnormal_flag,
-                    'reference_range' => $request->reference_range,
-                ]);
+                // REMOVED: $worklist->result_data = array_merge(...) — result lives in lis_results now
+                $worklist->latest_result_id = $resultId;   // NEW — point to the lis_results row
+                $worklist->result_count     = ($worklist->result_count ?? 0) + 1;
                 $worklist->save();
 
                 if ($worklist->test_sample_item_id) {
@@ -675,18 +670,19 @@ class MirthController extends Controller
                     continue;
                 }
 
-                // 🟢 Match the worklist (GLUE-aware)
+                // GLUE-aware match — REMOVED: sample_number filter (column dropped)
                 $worklist = Worklist::where('barcode', $result['barcode'])
                     ->where('test_code', $result['test_code'])
                     ->where('machine_id', $machine->id)
                     ->whereIn('status', ['pending', 'processing'])
-                    ->when(! empty($sampleNumber), fn ($q) => $q->where('sample_number', $sampleNumber))
                     ->when(! empty($suffix), fn ($q) => $q->where('suffix', $suffix))
                     ->orderBy('created_at', 'asc')
                     ->first();
 
+                $resultId = (string) Str::uuid7();
+
                 DB::table('lis_results')->insert([
-                    'id' => (string) Str::uuid7(),
+                    'id' => $resultId,
                     'worklist_id' => $worklist?->id,
                     'machine_id' => $machine->id,
                     'barcode' => $result['barcode'],
@@ -702,6 +698,8 @@ class MirthController extends Controller
                 if ($worklist) {
                     $worklist->status = 'completed';
                     $worklist->completed_at = now();
+                    $worklist->latest_result_id = $resultId;   // NEW — point to the lis_results row
+                    $worklist->result_count     = ($worklist->result_count ?? 0) + 1;
                     $worklist->save();
 
                     if ($worklist->test_sample_item_id) {

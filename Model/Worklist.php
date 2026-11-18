@@ -18,12 +18,12 @@ class Worklist extends BaseModel
 
     protected $fillable = [
         'id',
-        'order_id',
         'test_sample_item_id',
         'lab_receipt_id',
         'lab_test_id',
         'test_id',
         'machine_id',
+        'machine_mapping_id',   // NEW — machine_test_mappings(id) used for this row (was inside parameters JSON)
         'patient_id',
 
         // Barcode fields
@@ -47,32 +47,32 @@ class Worklist extends BaseModel
         // Worklist fields
         'priority',
         'status',
-        'order_date',
+        'cancelled_reason',     // NEW — replaces parameters.cancellation_reason
         'collection_date',
         'started_at',
         'completed_at',
         'pushed_at',
 
-        // Data fields
-        'parameters',
-        'result_data',
-        'reassignment_history',
+        // Multi-version result pointer (lis_results)
+        'latest_result_id',     // NEW — newest lis_results(id) for this row
+        'result_count',         // NEW — how many result versions exist
+        'source',               // NEW — fanout | manual | mirth | recheck
 
         // Legacy fields (backward compatibility)
         'suffix',
         'test_sample_id',
-        'sample_number',
+
+        // REMOVED: order_id, order_date, parameters, result_data,
+        //          reassignment_history, sample_number (columns dropped by
+        //          migration 2026_11_18_000001_column_reduction_worklist_chain)
     ];
 
     protected $casts = [
-        'order_date' => 'datetime',
         'collection_date' => 'datetime',
         'started_at' => 'datetime',
         'completed_at' => 'datetime',
         'pushed_at' => 'datetime',
-        'parameters' => 'array',
-        'result_data' => 'array',
-        'reassignment_history' => 'array',
+        'result_count' => 'integer',
         'patient_age' => 'integer',
     ];
 
@@ -276,18 +276,15 @@ class Worklist extends BaseModel
         });
     }
 
-    public function markAsCompleted(?array $resultData = null): bool
+    public function markAsCompleted(): bool
     {
-        return DB::transaction(function () use ($resultData) {
+        return DB::transaction(function () {
             if (!in_array($this->status, [self::STATUS_PENDING, self::STATUS_PROCESSING])) {
                 return false;
             }
 
             $this->status = self::STATUS_COMPLETED;
             $this->completed_at = now();
-            if ($resultData) {
-                $this->result_data = $resultData;
-            }
             $this->save();
 
             self::where('test_sample_item_id', $this->test_sample_item_id)
@@ -310,9 +307,7 @@ class Worklist extends BaseModel
     {
         $this->status = self::STATUS_CANCELLED;
         if ($reason) {
-            $params = $this->parameters ?? [];
-            $params['cancellation_reason'] = $reason;
-            $this->parameters = $params;
+            $this->cancelled_reason = $reason;   // NEW — dedicated column (was parameters.cancellation_reason)
         }
         return $this->save();
     }
@@ -357,15 +352,8 @@ class Worklist extends BaseModel
         $this->machine_id = $newMachineId;
         $this->status = self::STATUS_PENDING;
 
-        $history = $this->reassignment_history ?? [];
-        $history[] = [
-            'from_machine' => $oldMachineId,
-            'to_machine' => $newMachineId,
-            'reason' => $reason,
-            'reassigned_at' => now()->toISOString(),
-        ];
-        $this->reassignment_history = $history;
-
+        // Audit moved to the worklist_reassignments table
+        // (see WorklistService::reassignWorklist)
         return $this->save();
     }
 
@@ -479,7 +467,8 @@ class Worklist extends BaseModel
 
     public function getSampleNumberAttribute(): ?int
     {
-        return $this->testSampleItem?->testSample?->tube_sequence ?? $this->sample_number;
+        // worklists.sample_number was dropped — always derive from the tube
+        return $this->testSampleItem?->testSample?->tube_sequence;
     }
 
     public function getSlNoAttribute(): ?string
@@ -531,11 +520,6 @@ class Worklist extends BaseModel
         return $this->status === self::STATUS_LOCKED;
     }
 
-    public function generateOrderId(): string
-    {
-        return 'WL' . now()->format('ymd') . strtoupper(substr(uniqid(), -6));
-    }
-
     public function getPatientInfo(): array
     {
         return [
@@ -585,27 +569,14 @@ class Worklist extends BaseModel
             'status_badge' => $this->status_badge,
             'priority' => $this->priority,
             'priority_label' => $this->priority_label,
-            'order_date' => $this->order_date?->toISOString(),
             'collection_date' => $this->collection_date?->toISOString(),
             'started_at' => $this->started_at?->toISOString(),
             'completed_at' => $this->completed_at?->toISOString(),
         ];
     }
 
-    public function getParameter(string $key, $default = null)
-    {
-        return $this->parameters[$key] ?? $default;
-    }
-
-    public function getResult(string $key, $default = null)
-    {
-        return $this->result_data[$key] ?? $default;
-    }
-
-    public function hasResult(): bool
-    {
-        return !empty($this->result_data);
-    }
+    // REMOVED: getParameter(), getResult(), hasResult(), generateOrderId()
+    // (parameters / result_data / order_id columns are dropped)
 
     // ============================================
     // API Response Helper
@@ -615,7 +586,6 @@ class Worklist extends BaseModel
     {
         return [
             'worklist_id' => $this->id,
-            'order_id' => $this->order_id,
 
             // Barcodes
             'receipt_barcode' => $this->receipt_barcode,
@@ -655,15 +625,20 @@ class Worklist extends BaseModel
             'priority_label' => $this->priority_label,
 
             // Dates
-            'order_date' => $this->order_date?->toISOString(),
             'collection_date' => $this->collection_date?->toISOString(),
             'started_at' => $this->started_at?->toISOString(),
             'completed_at' => $this->completed_at?->toISOString(),
+            'pushed_at' => $this->pushed_at?->toISOString(),
 
-            // Data
-            'parameters' => $this->parameters,
-            'result_data' => $this->result_data,
-            'reassignment_history' => $this->reassignment_history,
+            // Result pointer + lifecycle (replaces parameters/result_data blobs)
+            'machine_mapping_id' => $this->machine_mapping_id,
+            'latest_result_id' => $this->latest_result_id,
+            'result_count' => $this->result_count,
+            'source' => $this->source,
+            'cancelled_reason' => $this->cancelled_reason,
+
+            // REMOVED: order_id, order_date, parameters, result_data,
+            //          reassignment_history (columns dropped)
         ];
     }
 
@@ -679,9 +654,7 @@ class Worklist extends BaseModel
             if (empty($model->id)) {
                 $model->id = (string) Str::uuid7();
             }
-            if (empty($model->order_id)) {
-                $model->order_id = $model->generateOrderId();
-            }
+            // REMOVED: order_id generation (column dropped)
         });
     }
 }

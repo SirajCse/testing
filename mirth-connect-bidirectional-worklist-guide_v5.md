@@ -2,6 +2,8 @@
 
 > **Scope:** everything A-to-Z in ONE document — worklist AND results, pull AND push, online Laravel server AND offline Mirth server, Bidirectional + Unidirectional + Manual, HL7 + ASTM + other protocols.
 > **Base:** consolidates v3/v4 guide + unified-result-ingest design + simplified schema (column reduction) into one reference. Patterns are the same as v4 — reorganized by analyzer channel.
+> **v5.1 (2026-11-18):** re-checked against the finalized migration `2026_11_18_000001_column_reduction_worklist_chain.php` (guarded, re-runnable) and the live phpMyAdmin dump of `worklists` (35 cols). Fixes: migration filename (§7), drop list names `uuid_new` only (no bare `uuid` in your live table), `result_count` UNSIGNED, `(barcode, status)` index already exists live, `worklists.suffix` KEPT for the OML payload (§7/§8), legacy payload keys annotated (§18). No flow, channel or endpoint changes.
+> **v5.2 (2026-11-18):** `test_sample_items.suffix` is KEPT (needed — tube identity); `test_sample_items` drops `sample_number` ONLY. The migration re-adds `test_sample_items.suffix` if the older 2026-11-17 draft already dropped it (§7).
 
 ---
 
@@ -173,29 +175,38 @@ Operator enters barcode + test in the LIS UI (or recheck flow) → same fan-out.
 
 ## 7. Laravel schema (simplified — this version)
 
-Applied by migration `2026_11_17_000001_simplify_worklist_chain_columns.php`:
+Applied by migration `2026_11_18_000001_column_reduction_worklist_chain.php` (guarded, re-runnable — full code in `worklist-column-reduction-laravel-guide.md` §1):
 
 ```sql
--- worklists: DROPPED order_id, sample_number, uuid, uuid_new,
---            parameters, result_data, reassignment_history, order_date
+-- worklists: DROPPED order_id (+ its UNIQUE index), uuid_new,
+--            sample_number (+ its INDEX), order_date,
+--            parameters, result_data, reassignment_history
+--            (uuid_new only — your live table has no bare `uuid` column;
+--             worklists.suffix is KEPT — tube identity for the Mirth OML payload)
 -- worklists: ADDED
 ALTER TABLE worklists
   ADD COLUMN machine_mapping_id CHAR(36) NULL AFTER machine_id,
   ADD COLUMN cancelled_reason   VARCHAR(255) NULL AFTER status,
   ADD COLUMN latest_result_id   CHAR(36) NULL AFTER cancelled_reason,
-  ADD COLUMN result_count       INT NOT NULL DEFAULT 0 AFTER latest_result_id,
+  ADD COLUMN result_count       INT UNSIGNED NOT NULL DEFAULT 0 AFTER latest_result_id,
   ADD COLUMN source             VARCHAR(20) NOT NULL DEFAULT 'fanout' AFTER result_count,
   ADD INDEX idx_worklist_latest_result (latest_result_id);
 
+-- duplicate pre-check (column-reduction guide §15) MUST return 0 rows first —
+-- the migration itself re-checks and fails with the offending rows listed:
+-- SELECT test_sample_item_id, machine_id, COUNT(*) AS n FROM worklists
+-- WHERE test_sample_item_id IS NOT NULL GROUP BY 1, 2 HAVING n > 1;
 ALTER TABLE worklists
   ADD UNIQUE KEY uq_worklist_item_machine (test_sample_item_id, machine_id);
 
 ALTER TABLE worklists
-  ADD INDEX idx_worklist_machine_status_pushed (machine_id, status, pushed_at),
-  ADD INDEX idx_worklist_barcode_status (barcode, status);
+  ADD INDEX idx_worklist_machine_status_pushed (machine_id, status, pushed_at);
+  -- NOTE: (barcode, status) ALREADY EXISTS in your live table — kept as-is, never recreated
 
 -- test_samples:  DROPPED sl_no
--- test_sample_items: DROPPED suffix, sample_number
+-- test_sample_items: DROPPED sample_number ONLY
+--                    (test_sample_items.suffix KEPT — needed tube identity;
+--                     re-added by the migration if the old draft dropped it)
 -- new audit table: worklist_reassignments (optional)
 ```
 
@@ -235,7 +246,7 @@ CREATE TABLE lis_results (
 
 ## 8. Mirth local `lis_cache` schema (PostgreSQL)
 
-Matches the simplified Laravel columns — no `order_id`/`sample_number`/`suffix`.
+Matches the simplified Laravel columns — no `order_id`/`sample_number`. (Laravel KEEPS `worklists.suffix` for the OML payload; the cache does not mirror it — the value already rides inside `receipt_barcode`.)
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS lis_cache AUTHORIZATION mirth;
@@ -627,7 +638,7 @@ Route::get('/mirth/machine-config/{device_model}',
     [\App\Http\Controllers\MachineConfigController::class, 'show']);
 ```
 
-This replaces the per-row `parameters` JSON that used to be embedded in worklists — each Mirth channel fetches + caches the config ONCE (deploy script or Configuration Map).
+This replaces the per-row `parameters` JSON that used to be embedded in worklists — each Mirth channel fetches + caches the config ONCE (deploy script or Configuration Map). For the `ALL` variant used by §5 Option B and §14, add the `show('ALL')` branch shown in §14 to this controller.
 
 ---
 
@@ -944,7 +955,7 @@ else if (msgType == 'ORU^R01') {
     // queue for sync-push — Laravel is NEVER called from this channel
     var payload = JSON.stringify({
         barcode: barcode,
-        sample_number: null, suffix: null,
+        sample_number: null, suffix: null,   // legacy payload keys — ignored; Laravel resolves the tube by barcode (test_sample_items.suffix kept server-side)
         results: results,
         device_model: DEVICE_MODEL,
         run_id: runId,

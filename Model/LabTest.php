@@ -86,7 +86,7 @@ class LabTest extends BaseModel
     public function test_samples(): BelongsToMany
     {
         return $this->belongsToMany(TestSample::class, 'test_sample_items', 'lab_test_id', 'test_sample_id')
-            ->withPivot('suffix', 'sample_number', 'status', 'collected_by', 'collected_at')
+            ->withPivot('suffix', 'status', 'collected_by', 'collected_at')   // REMOVED: 'sample_number' (column dropped); suffix KEPT (needed)
             ->withTimestamps();
     }
 

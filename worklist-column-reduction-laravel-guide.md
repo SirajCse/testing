@@ -2,20 +2,28 @@
 
 > All-in-one file. Each section shows the file path + the exact code change. No explanations — only what to drop, what to keep, what to add.
 
+> **v2 (2026-11-18) — schema-accurate.** Rewritten against the live phpMyAdmin dump of `worklists` (35 columns, including `order_id` + UNIQUE index, `uuid_new`, `sample_number` + INDEX). The migration is now **guarded and re-runnable** — every step checks the current structure first, so it cannot conflict with your DB no matter which state it is in. New in v2: git test workflow (§12), pre-migration checks SQL (§15), post-migration verification SQL (§16), rollback (§17), optional index cleanup (§18), FAQ (§19).
+>
+> Package: `column-reduction-laravel-package.zip` — contains every NEW file (migration, schema test, the two SQL scripts, this guide). Nothing in the zip overwrites your existing app code; model/controller changes below are copy-paste patches.
+
 ---
 
 ## File paths touched
 
 ```
-database/migrations/2026_11_17_000001_simplify_worklist_chain_columns.php   (NEW)
+database/migrations/2026_11_18_000001_column_reduction_worklist_chain.php    (NEW — replaces the 2026_11_17 draft)
+tests/Feature/ColumnReductionSchemaTest.php                                  (NEW)
+scripts/pre_migration_checks.sql                                             (NEW — full SQL in §15)
+scripts/post_migration_verification.sql                                      (NEW — full SQL in §16)
 app/Models/Worklist.php
 app/Models/TestSample.php
 app/Models/TestSampleItem.php
+app/Models/LabTest.php
 app/Services/WorklistService.php
 app/Http/Controllers/MirthController.php
 app/Http/Controllers/WorklistController.php
 app/Http/Controllers/SampleController.php
-app/Http/Controllers/MachineConfigController.php                            (NEW)
+app/Http/Controllers/MachineConfigController.php                             (NEW)
 routes/api.php
 ```
 
@@ -23,116 +31,319 @@ routes/api.php
 
 ## 1. Migration
 
-**`database/migrations/2026_11_17_000001_simplify_worklist_chain_columns.php`**
+**`database/migrations/2026_11_18_000001_column_reduction_worklist_chain.php`** (NEW file)
+
+What makes it safe (no conflict with your live DB):
+
+- every `dropColumn` / `addColumn` / index change is guarded by `Schema::hasColumn` / `indexExists` → re-runnable, skips what is already done;
+- index drops are name-tolerant (tries `worklists_order_id_unique`, `order_id`, `order_id_unique` — and MySQL auto-drops a single-column index with its column anyway);
+- before adding `UNIQUE (test_sample_item_id, machine_id)` it runs the duplicate check and **fails with the offending rows listed** instead of crashing on constraint creation;
+- works on MySQL/MariaDB (production) and SQLite (test runs).
 
 ```php
 <?php
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
+/**
+ * Column Reduction — worklists / test_samples / test_sample_items
+ *
+ * worklists         DROP: order_id (+UNIQUE), uuid_new, sample_number (+INDEX),
+ *                         order_date, parameters, result_data, reassignment_history
+ *                   ADD : machine_mapping_id, cancelled_reason, latest_result_id,
+ *                         result_count, source
+ *                   IDX : +uq_worklist_item_machine UNIQUE (test_sample_item_id, machine_id)
+ *                         +idx_worklist_machine_status_pushed (machine_id, status, pushed_at)
+ *                         +idx_worklist_latest_result
+ *                   KEEP: barcode, receipt_barcode, suffix, timing (Mirth OML payload — §1.7.7)
+ * test_samples      DROP: sl_no
+ * test_sample_items DROP: sample_number
+ *                   KEEP: suffix (NEEDED — tube identity; re-added if the older
+ *                         2026_11_17 draft already dropped it)
+ * new table         worklist_reassignments (optional audit)
+ */
 return new class extends Migration
 {
     public function up(): void
     {
-        // ── 1) worklists: drop JSON blobs + redundant date (§1.7.4 + §1.7.8) ──
-        Schema::table('worklists', function (Blueprint $table) {
-            $table->dropColumn([
-                'parameters',
-                'result_data',
-                'reassignment_history',
-                'order_date',
-                // Add if not dropped earlier:
-                // 'uuid', 'uuid_new', 'sample_number',
-            ]);
-        });
-
-        Schema::table('worklists', function (Blueprint $table) {
-            $table->char('machine_mapping_id', 36)->nullable()->after('machine_id');
-            $table->string('cancelled_reason', 255)->nullable()->after('status');
-
-            // Multi-version result pointer
-            $table->char('latest_result_id', 36)->nullable()->after('cancelled_reason');
-            $table->integer('result_count')->default(0)->after('latest_result_id');
-            $table->string('source', 20)->default('fanout')->after('result_count');
-
-            $table->index('latest_result_id', 'idx_worklist_latest_result');
-        });
-
-        Schema::table('worklists', function (Blueprint $table) {
-            $table->unique(['test_sample_item_id', 'machine_id'], 'uq_worklist_item_machine');
-        });
-
-        Schema::table('worklists', function (Blueprint $table) {
-            $table->index(['machine_id', 'status', 'pushed_at'], 'idx_worklist_machine_status_pushed');
-            $table->index(['barcode', 'status'], 'idx_worklist_barcode_status');
-        });
-
-        // ── 2) test_samples: drop sl_no (§1.7.9) ──
-        Schema::table('test_samples', function (Blueprint $table) {
-            $table->dropColumn('sl_no');
-        });
-
-        // ── 3) test_sample_items: drop suffix + sample_number (§1.7.9) ──
-        Schema::table('test_sample_items', function (Blueprint $table) {
-            $table->dropColumn(['suffix', 'sample_number']);
-        });
-
-        // ── 4) worklist_reassignments audit table (§1.7.3 — optional) ──
-        Schema::create('worklist_reassignments', function (Blueprint $table) {
-            $table->char('id', 36)->primary();
-            $table->char('worklist_id', 36);
-            $table->char('from_machine_id', 36);
-            $table->char('to_machine_id', 36);
-            $table->string('reason', 255)->nullable();
-            $table->timestamps();
-            $table->index('worklist_id', 'idx_reassign_worklist');
-        });
+        $this->reduceWorklists();
+        $this->reduceTestSamples();
+        $this->reduceTestSampleItems();
+        $this->createReassignmentAuditTable();
     }
 
     public function down(): void
     {
+        // Restores STRUCTURE only — data of the dropped columns is NOT recoverable.
+        // Full data restore: mysql -u USER -p DBNAME < database/before_column_reduction.sql
         Schema::dropIfExists('worklist_reassignments');
+        $this->restoreTestSampleItems();
+        $this->restoreTestSamples();
+        $this->restoreWorklists();
+    }
 
-        Schema::table('test_sample_items', function (Blueprint $table) {
-            $table->string('suffix', 20)->nullable()->after('status');
-            $table->integer('sample_number')->nullable()->after('suffix');
+    /* ───────────────────────────── up ───────────────────────────── */
+
+    private function reduceWorklists(): void
+    {
+        // 1) indexes tied to columns being dropped.
+        //    MySQL auto-drops a single-column index when its column is dropped;
+        //    these explicit drops are name-tolerant and keep SHOW INDEX tidy.
+        $this->dropIndexIfExact('worklists', ['worklists_order_id_unique', 'order_id', 'order_id_unique']);
+        $this->dropIndexIfExact('worklists', ['worklists_sample_number_index', 'sample_number', 'sample_number_index']);
+
+        // 2) drop the dead columns (only the ones that still exist)
+        $drop = array_values(array_filter([
+            'order_id',
+            'uuid_new',
+            'sample_number',
+            'order_date',
+            'parameters',
+            'result_data',
+            'reassignment_history',
+        ], fn (string $c): bool => Schema::hasColumn('worklists', $c)));
+
+        if ($drop !== []) {
+            Schema::table('worklists', fn (Blueprint $t) => $t->dropColumn($drop));
+        }
+
+        // 3) promoted + multi-version result-pointer columns
+        Schema::table('worklists', function (Blueprint $t): void {
+            if (! Schema::hasColumn('worklists', 'machine_mapping_id')) {
+                $t->char('machine_mapping_id', 36)->nullable()->after('machine_id')
+                    ->comment('machine_test_mappings(id) used for this row (was inside parameters JSON)');
+            }
+            if (! Schema::hasColumn('worklists', 'cancelled_reason')) {
+                $t->string('cancelled_reason', 255)->nullable()->after('status');
+            }
+            if (! Schema::hasColumn('worklists', 'latest_result_id')) {
+                $t->char('latest_result_id', 36)->nullable()->after('cancelled_reason')
+                    ->comment('lis_results(id) — newest result version');
+            }
+            if (! Schema::hasColumn('worklists', 'result_count')) {
+                $t->unsignedInteger('result_count')->default(0)->after('latest_result_id');
+            }
+            if (! Schema::hasColumn('worklists', 'source')) {
+                $t->string('source', 20)->default('fanout')->after('result_count')
+                    ->comment('fanout | manual | mirth | recheck');
+            }
         });
 
-        Schema::table('test_samples', function (Blueprint $table) {
-            $table->string('sl_no', 100)->nullable()->after('barcode');
+        // 4) hot-path indexes
+        Schema::table('worklists', function (Blueprint $t): void {
+            if (! $this->indexExists('worklists', 'idx_worklist_machine_status_pushed')) {
+                // Mirth pull: WHERE machine_id = ? AND status = 'pending' AND pushed_at IS NULL
+                $t->index(['machine_id', 'status', 'pushed_at'], 'idx_worklist_machine_status_pushed');
+            }
+            if (! $this->indexExists('worklists', 'idx_worklist_latest_result')) {
+                $t->index('latest_result_id', 'idx_worklist_latest_result');
+            }
         });
 
-        Schema::table('worklists', function (Blueprint $table) {
-            $table->dropIndex('idx_worklist_barcode_status');
-            $table->dropIndex('idx_worklist_machine_status_pushed');
-            $table->dropUnique('uq_worklist_item_machine');
-            $table->dropIndex('idx_worklist_latest_result');
-            $table->dropColumn([
-                'source', 'result_count', 'latest_result_id',
-                'cancelled_reason', 'machine_mapping_id',
-            ]);
-            $table->timestamp('order_date')->nullable()->after('status');
-            $table->json('reassignment_history')->nullable();
-            $table->json('result_data')->nullable();
-            $table->json('parameters')->nullable()->after('machine_id');
+        // 5) one worklist per sample-item per machine (duplicate guard — §1.4).
+        //    Runs the duplicate pre-check first and FAILS with the offending
+        //    rows if production data would violate the constraint.
+        if (! $this->indexExists('worklists', 'uq_worklist_item_machine')) {
+            $this->assertNoItemMachineDuplicates();
+
+            Schema::table('worklists', fn (Blueprint $t) =>
+                $t->unique(['test_sample_item_id', 'machine_id'], 'uq_worklist_item_machine')
+            );
+        }
+    }
+
+    private function reduceTestSamples(): void
+    {
+        if (Schema::hasColumn('test_samples', 'sl_no')) {
+            Schema::table('test_samples', fn (Blueprint $t) => $t->dropColumn('sl_no'));
+        }
+    }
+
+    private function reduceTestSampleItems(): void
+    {
+        // suffix is NEEDED — never dropped. If the older 2026_11_17 draft already
+        // dropped it, re-add it here (structure only; old values are not recoverable).
+        if (! Schema::hasColumn('test_sample_items', 'suffix')) {
+            Schema::table('test_sample_items', fn (Blueprint $t) => $t->string('suffix', 20)->nullable());
+        }
+
+        if (Schema::hasColumn('test_sample_items', 'sample_number')) {
+            // MySQL auto-drops the single-column index on this column
+            Schema::table('test_sample_items', fn (Blueprint $t) => $t->dropColumn('sample_number'));
+        }
+    }
+
+    private function createReassignmentAuditTable(): void
+    {
+        // Optional (§1.7.3) — replaces the dropped reassignment_history JSON.
+        // Delete the call in up() if you don't audit machine reassignments.
+        if (! Schema::hasTable('worklist_reassignments')) {
+            Schema::create('worklist_reassignments', function (Blueprint $t): void {
+                $t->char('id', 36)->primary();
+                $t->char('worklist_id', 36);
+                $t->char('from_machine_id', 36);
+                $t->char('to_machine_id', 36);
+                $t->string('reason', 255)->nullable();
+                $t->timestamps();
+                $t->index('worklist_id', 'idx_reassign_worklist');
+            });
+        }
+    }
+
+    /* ──────────────────────────── down ──────────────────────────── */
+
+    private function restoreWorklists(): void
+    {
+        if ($this->indexExists('worklists', 'uq_worklist_item_machine')) {
+            Schema::table('worklists', fn (Blueprint $t) => $t->dropUnique('uq_worklist_item_machine'));
+        }
+        if ($this->indexExists('worklists', 'idx_worklist_machine_status_pushed')) {
+            Schema::table('worklists', fn (Blueprint $t) => $t->dropIndex('idx_worklist_machine_status_pushed'));
+        }
+        if ($this->indexExists('worklists', 'idx_worklist_latest_result')) {
+            Schema::table('worklists', fn (Blueprint $t) => $t->dropIndex('idx_worklist_latest_result'));
+        }
+
+        Schema::table('worklists', function (Blueprint $t): void {
+            if (! Schema::hasColumn('worklists', 'machine_mapping_id')) {
+                $t->char('machine_mapping_id', 36)->nullable();
+            }
+            if (! Schema::hasColumn('worklists', 'cancelled_reason')) {
+                $t->string('cancelled_reason', 255)->nullable();
+            }
+            if (! Schema::hasColumn('worklists', 'latest_result_id')) {
+                $t->char('latest_result_id', 36)->nullable();
+            }
+            if (! Schema::hasColumn('worklists', 'result_count')) {
+                $t->unsignedInteger('result_count')->default(0);
+            }
+            if (! Schema::hasColumn('worklists', 'source')) {
+                $t->string('source', 20)->default('fanout');
+            }
         });
+
+        // columns dropped by up() — structure only, old data is gone
+        Schema::table('worklists', function (Blueprint $t): void {
+            if (! Schema::hasColumn('worklists', 'order_id')) {
+                $t->string('order_id', 36)->nullable();
+            }
+            if (! Schema::hasColumn('worklists', 'uuid_new')) {
+                $t->uuid('uuid_new')->nullable();
+            }
+            if (! Schema::hasColumn('worklists', 'sample_number')) {
+                $t->integer('sample_number')->default(1);
+            }
+            if (! Schema::hasColumn('worklists', 'order_date')) {
+                // was NOT NULL originally; nullable here because the table may already hold rows
+                $t->timestamp('order_date')->nullable();
+            }
+            if (! Schema::hasColumn('worklists', 'parameters')) {
+                $t->longText('parameters')->nullable();
+            }
+            if (! Schema::hasColumn('worklists', 'result_data')) {
+                $t->longText('result_data')->nullable();
+            }
+            if (! Schema::hasColumn('worklists', 'reassignment_history')) {
+                $t->longText('reassignment_history')->nullable();
+            }
+        });
+
+        if (Schema::hasColumn('worklists', 'order_id') && ! $this->indexExists('worklists', 'worklists_order_id_unique')) {
+            Schema::table('worklists', fn (Blueprint $t) => $t->unique('order_id', 'worklists_order_id_unique'));
+        }
+    }
+
+    private function restoreTestSamples(): void
+    {
+        Schema::table('test_samples', function (Blueprint $t): void {
+            if (! Schema::hasColumn('test_samples', 'sl_no')) {
+                $t->string('sl_no', 100)->nullable();
+            }
+        });
+    }
+
+    private function restoreTestSampleItems(): void
+    {
+        // suffix is NOT restored here — up() never drops it (it is needed).
+        Schema::table('test_sample_items', function (Blueprint $t): void {
+            if (! Schema::hasColumn('test_sample_items', 'sample_number')) {
+                $t->integer('sample_number')->nullable();
+            }
+        });
+    }
+
+    /* ─────────────────────────── helpers ─────────────────────────── */
+
+    private function indexExists(string $table, string $index): bool
+    {
+        if (DB::connection()->getDriverName() === 'sqlite') {
+            return (bool) DB::selectOne(
+                "SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'index' AND name = ?",
+                [$index]
+            )->c;
+        }
+
+        return (int) (DB::selectOne(
+            'SELECT COUNT(*) AS c FROM information_schema.statistics
+             WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?',
+            [$table, $index]
+        )->c ?? 0) > 0;
+    }
+
+    private function dropIndexIfExact(string $table, array $candidates): void
+    {
+        if (DB::connection()->getDriverName() === 'sqlite') {
+            return; // test runs — dropping the column removes single-column indexes automatically
+        }
+
+        foreach ($candidates as $name) {
+            if ($this->indexExists($table, $name)) {
+                DB::statement("ALTER TABLE `{$table}` DROP INDEX `{$name}`");
+
+                return;
+            }
+        }
+    }
+
+    private function assertNoItemMachineDuplicates(): void
+    {
+        $dupes = DB::select(
+            'SELECT test_sample_item_id, machine_id, COUNT(*) AS n
+             FROM worklists
+             WHERE test_sample_item_id IS NOT NULL
+             GROUP BY test_sample_item_id, machine_id
+             HAVING n > 1
+             LIMIT 5'
+        );
+
+        if ($dupes !== []) {
+            $rows = implode('; ', array_map(
+                fn ($r) => "item={$r->test_sample_item_id} machine={$r->machine_id} x{$r->n}",
+                $dupes
+            ));
+
+            throw new RuntimeException(
+                'UNIQUE (test_sample_item_id, machine_id) blocked: duplicate worklists found. ' .
+                'Cancel the older duplicates (guide §15 step 4), then re-run migrate. Offenders: ' . $rows
+            );
+        }
     }
 };
 ```
 
-Run:
+Two notes before running:
 
-```bash
-php artisan migrate
-```
+- If your project still has the earlier draft `2026_11_17_000001_simplify_worklist_chain_columns.php` **and it was never run** (`php artisan migrate:status` does not list it as Ran) → delete it. This file replaces it.
+- If phpMyAdmin shows migrations newer than 2026-11-18, rename this file's timestamp prefix so it sorts **after** your latest migration (Laravel runs migrations in filename order).
 
 ---
 
 ## 2. `app/Models/Worklist.php`
 
-### `$fillable` — REMOVE 4 lines, ADD 5
+### `$fillable` — REMOVE 6, ADD 5, KEEP `suffix`
 
 ```php
 protected $fillable = [
@@ -147,6 +358,7 @@ protected $fillable = [
 
     'barcode',
     'receipt_barcode',
+    'suffix',                  // KEEP (§1.7.7 — tube identity for the Mirth OML payload)
 
     'patient_name',
     'patient_age',
@@ -172,10 +384,11 @@ protected $fillable = [
 
     'test_sample_id',
 ];
-// REMOVED: order_id, sample_number, suffix, parameters, result_data, reassignment_history
+// REMOVED: order_id, uuid_new, sample_number, order_date, parameters,
+//          result_data, reassignment_history
 ```
 
-### `$casts` — REMOVE 3 lines
+### `$casts` — REMOVE the JSON/date casts of dropped columns
 
 ```php
 protected $casts = [
@@ -184,6 +397,7 @@ protected $casts = [
     'completed_at'    => 'datetime',
     'pushed_at'       => 'datetime',
     'patient_age'     => 'integer',
+    'result_count'    => 'integer',
 ];
 // REMOVED: 'order_date' => 'datetime', 'parameters' => 'array',
 //          'result_data' => 'array', 'reassignment_history' => 'array'
@@ -257,9 +471,10 @@ public function changeMachine(string $newMachineId, ?string $reason = null): boo
 public function getParameter(string $key, $default = null)  // DELETE
 public function getResult(string $key, $default = null)      // DELETE
 public function hasResult(): bool                            // DELETE
+public function generateOrderId(): string                    // DELETE (no more order_id)
 ```
 
-### `toApiResponse()` — REMOVE 4 keys
+### `toApiResponse()` — REMOVE the dropped keys
 
 ```php
 public function toApiResponse(): array
@@ -310,11 +525,11 @@ public function toApiResponse(): array
         'source'             => $this->source,
         'cancelled_reason'   => $this->cancelled_reason,
     ];
-    // REMOVED: order_id, order_date, parameters, result_data, reassignment_history
+    // REMOVED: order_id, order_date, uuid_new, parameters, result_data, reassignment_history
 }
 ```
 
-### `boot()` — drop `order_id` generation
+### `boot()` — drop `order_id` / `uuid_new` generation
 
 ```php
 protected static function boot()
@@ -325,15 +540,9 @@ protected static function boot()
         if (empty($model->id)) {
             $model->id = (string) Str::uuid7();
         }
-        // REMOVED: order_id generation (column dropped)
+        // REMOVED: order_id / uuid_new generation (columns dropped)
     });
 }
-```
-
-### DELETE these methods (referenced dropped columns)
-
-```php
-public function generateOrderId(): string  // DELETE (no more order_id)
 ```
 
 ---
@@ -366,7 +575,7 @@ protected $fillable = [
 
 ## 4. `app/Models/TestSampleItem.php`
 
-### `$fillable` — REMOVE 2 lines
+### `$fillable` — REMOVE 1 line (`sample_number`), KEEP `suffix`
 
 ```php
 protected $fillable = [
@@ -378,7 +587,8 @@ protected $fillable = [
     'collected_by',
     'collected_at',
     'notes',
-    // REMOVED: 'suffix', 'sample_number',
+    'suffix',                  // KEEP — needed (column stays on test_sample_items)
+    // REMOVED: 'sample_number',
     'status',
 ];
 ```
@@ -387,14 +597,14 @@ protected $fillable = [
 
 ## 5. `app/Models/LabTest.php`
 
-### Line 89 — drop `suffix`, `sample_number` from `withPivot`
+### Line 89 — drop `sample_number` from `withPivot` (KEEP `suffix`)
 
 ```php
 public function sampleItems()
 {
     return $this->belongsToMany(TestSample::class, 'test_sample_items', 'lab_test_id', 'test_sample_id')
-        ->withPivot('status', 'collected_by', 'collected_at');
-        // REMOVED: 'suffix', 'sample_number'
+        ->withPivot('status', 'collected_by', 'collected_at', 'suffix');
+        // REMOVED: 'sample_number'   (suffix STAYS — the column is kept)
 }
 ```
 
@@ -421,6 +631,8 @@ $items = TestSampleItem::with([
 $tubeSequence = $testSample->tube_sequence;
 $sampleNumber = $tubeSequence;   // simple — was a long ?? chain through $item->sample_number
 $suffix       = $this->parseSuffixFromBarcode($barcode) ?? $testSample->timing;
+// DELETE the two locals above if nothing else uses them — the sample_number /
+// suffix worklist writes are gone (suffix value rides inside receipt_barcode).
 
 try {
     $worklist = Worklist::create([
@@ -453,7 +665,7 @@ try {
         'status'          => $status,
         'collection_date' => $testSample->collected_at ?? now(),
         'source'          => 'fanout',
-        // REMOVED: order_date, parameters, sample_number, suffix
+        // REMOVED: order_date, parameters, sample_number (suffix column kept, not written here)
     ]);
 
     Log::info('WORKLIST CREATED', [
@@ -627,7 +839,7 @@ public function reassignWorklist(string $worklistId, string $newMachineId, ?stri
 // REMOVED: 'parameters' => $worklist->parameters,
 ```
 
-### Lines 540-549 — `legacyResult` — drop `result_data` block
+### Lines 540-549 — `legacyResult` — drop `result_data` block, keep the pointer update
 
 ```php
 if ($worklist) {
@@ -683,14 +895,15 @@ if (in_array($columnName, ['barcode', 'date'])) {
 // And ensure ->with('labReceipt') is on the query
 ```
 
-### Line 1113-1114 — `getWorklistForMirth` response — drop `sample_number`, `suffix`
+> Note: `test_samples.sl_no` is dropped — `lab_receipts.sl_no` is a DIFFERENT column on a different table and is kept.
+
+### Line 1113-1114 — `getWorklistForMirth` response — drop `sample_number`
 
 ```php
 'barcode'         => $worklist->barcode,
 'receipt_barcode' => $worklist->receipt_barcode,
 'timing'          => $worklist->timing,
 // REMOVED: 'sample_number' => $worklist->sample_number,
-// REMOVED: 'suffix'        => $worklist->suffix,
 ```
 
 ### Line 1124 — `getWorklistForMirth` response — drop `order_date`
@@ -747,7 +960,7 @@ No changes.
 
 ### Lines 722-732, 836-846 — `TestSampleItem::insert()` arrays
 
-Already correct (never set `suffix`/`sample_number`/`order_date`). No changes needed.
+Already correct (never set `sample_number`/`order_date`), and `suffix` is kept anyway (needed) — nothing to remove here. No changes needed.
 
 ### Lines 980 — note (`'note' => $validator->messages()`)
 
@@ -824,38 +1037,84 @@ Route::get('/mirth/machine-config/{device_model}', [\App\Http\Controllers\Machin
 
 ---
 
-## 12. After migration — verify
+## 12. Git test & update workflow (test first, then update — no conflict)
 
 ```bash
-# Run migration
+## 0) branch + backup
+cd /var/www/your-lis                        # your project root
+git checkout main && git pull
+git checkout -b refactor/worklist-column-reduction
+
+# backup ONLY the 3 touched tables (fast, restorable)
+mysqldump -u USER -p DBNAME worklists test_samples test_sample_items \
+  > database/before_column_reduction.sql
+
+## 1) copy the NEW files from the zip (nothing overwrites your app code)
+#    database/migrations/2026_11_18_000001_column_reduction_worklist_chain.php
+#    tests/Feature/ColumnReductionSchemaTest.php
+#    scripts/pre_migration_checks.sql / scripts/post_migration_verification.sql
+#
+# old draft — delete ONLY if it was never run:
+php artisan migrate:status | grep 2026_11_17 || \
+  git rm -f database/migrations/2026_11_17_000001_simplify_worklist_chain_columns.php
+
+## 2) pre-checks (phpMyAdmin / mysql CLI) — full SQL in §15
+#    • step 3 (duplicate check) MUST return 0 rows
+#    • note the row counts (step 2) — compare again after migrate
+
+## 3) dry run — prints the SQL, changes nothing
+php artisan migrate --pretend
+
+## 4) apply
 php artisan migrate
+php artisan migrate:status                  # new file shows "Ran"
 
-# Clear caches
-php artisan config:clear
-php artisan route:clear
-php artisan cache:clear
+## 5) schema smoke test — point the test DB at a COPY, never production
+#    phpunit.xml:  <env name="DB_DATABASE" value="lab_test_copy"/>
+php artisan test --filter=ColumnReductionSchemaTest
+php artisan test                            # full suite
 
-# Check worklists table structure
+## 6) leftover-reference scan — every hit must be fixed or justified
+grep -rn --include=*.php -E "order_date|uuid_new|reassignment_history|sl_no" app/ database/ resources/
+grep -rn --include=*.php -E "'parameters'|'result_data'" app/
+grep -rn --include=*.php "sample_number" app/
+
+## 7) manual smoke on dev
+#    receipt → collect → fan-out worklists
+#    Mirth pull channel returns OML for one analyzer
+#    push one ORU/result → worklist shows result_count=1, latest_result_id set, status completed
 php artisan tinker
->>> Schema::getColumnListing('worklists');
->>> Schema::getColumnListing('test_samples');
->>> Schema::getColumnListing('test_sample_items');
+>>> Schema::getColumnListing('worklists');        // 33 columns
+>>> Schema::getColumnListing('test_samples');     // 15 columns
+>>> Schema::getColumnListing('test_sample_items');// 10 columns (suffix KEPT)
+
+## 8) commit + merge
+git add -A
+git commit -m "refactor(worklists): column reduction — drop dead cols, promote machine_mapping_id/cancelled_reason, add result pointer + covering indexes"
+git checkout main && git merge --no-ff refactor/worklist-column-reduction
+
+## 9) production deploy (same order: pre-checks → migrate → verify)
+#    §15 pre_migration_checks.sql  →  php artisan migrate  →  §16 post_migration_verification.sql
+php artisan config:clear && php artisan route:clear && php artisan cache:clear
 ```
 
 ---
 
 ## 13. Final column counts
 
-| Table | Before | After | Removed |
+| Table | Before (live dump 2026-11-18) | After | Removed |
 |---|---|---|---|
-| `worklists` | 30+ | 24 | `order_id`, `sample_number`, `uuid`, `uuid_new`, `parameters`, `result_data`, `reassignment_history`, `order_date` |
+| `worklists` | **35** | **33** | `order_id`, `uuid_new`, `sample_number`, `order_date`, `parameters`, `result_data`, `reassignment_history` |
 | `test_samples` | 16 | 15 | `sl_no` |
-| `test_sample_items` | 11 | 9 | `suffix`, `sample_number` |
+| `test_sample_items` | 11 | 10 | `sample_number` |
 
 **Added:**
 - `worklists`: `machine_mapping_id`, `cancelled_reason`, `latest_result_id`, `result_count`, `source`
+- Indexes: `uq_worklist_item_machine` (UNIQUE), `idx_worklist_machine_status_pushed`, `idx_worklist_latest_result` — `(barcode, status)` already exists in your table and is kept as-is
 - New table: `worklist_reassignments` (optional audit)
 - New endpoint: `GET /api/mirth/machine-config/{device_model}`
+
+Row size effect (§1.7.5 of the design doc): dropping the 3 LONGTEXT JSON blobs + 4 dead columns and adding 5 compact ones takes the typical row from ~600-800 B to ~280-320 B → ~2× more rows per InnoDB page → faster Mirth pull and DataTables paths.
 
 ---
 
@@ -880,3 +1139,209 @@ if (json.success) {
 ```
 
 This replaces the per-row `parameters` JSON payload — Mirth now has the mapping config in its Configuration Map and can look up by `test_code` or `test_id` directly.
+
+---
+
+## 15. Pre-migration checks SQL (`scripts/pre_migration_checks.sql`)
+
+```sql
+-- 0) BACKUP FIRST (server shell):
+--    mysqldump -u USER -p DBNAME worklists test_samples test_sample_items \
+--      > database/before_column_reduction.sql
+
+-- 1) Actual index names on worklists (migration is name-tolerant, note them anyway)
+SHOW INDEX FROM worklists;
+
+-- 2) Row counts BEFORE — compare after migrate
+SELECT
+  (SELECT COUNT(*) FROM worklists)         AS worklists_rows,
+  (SELECT COUNT(*) FROM test_samples)      AS test_samples_rows,
+  (SELECT COUNT(*) FROM test_sample_items) AS test_sample_items_rows;
+
+-- 3) DUPLICATE CHECK for the new UNIQUE (test_sample_item_id, machine_id)
+--    MUST return 0 rows — otherwise the migration stops with an error.
+SELECT test_sample_item_id, machine_id, COUNT(*) AS n
+FROM worklists
+WHERE test_sample_item_id IS NOT NULL
+GROUP BY test_sample_item_id, machine_id
+HAVING n > 1;
+
+-- 4) If step 3 returned rows — inspect the offenders:
+SELECT w.id, w.barcode, w.receipt_barcode, w.test_id, w.test_name,
+       w.status, w.test_sample_item_id, w.machine_id, w.created_at
+FROM worklists w
+JOIN (
+    SELECT test_sample_item_id, machine_id
+    FROM worklists
+    WHERE test_sample_item_id IS NOT NULL
+    GROUP BY test_sample_item_id, machine_id
+    HAVING COUNT(*) > 1
+) d ON w.test_sample_item_id = d.test_sample_item_id
+   AND w.machine_id = d.machine_id
+ORDER BY w.test_sample_item_id, w.machine_id, w.created_at;
+
+-- 4b) Fix: keep the newest PENDING/PROCESSING row, CANCEL the older
+--     duplicates (never hard-delete in production). Replace the ids:
+-- UPDATE worklists
+-- SET status = 'cancelled', cancelled_reason = 'duplicate worklist cleanup'
+-- WHERE id IN ('OLDER-DUPLICATE-ID-1', 'OLDER-DUPLICATE-ID-2');
+
+-- 5) Evidence check — are the doomed columns really dead?
+--    (suffix columns are NOT doomed: worklists.suffix kept — §1.7.7 Mirth OML
+--     payload; test_sample_items.suffix kept — needed tube identity)
+SELECT
+  SUM(order_id IS NOT NULL)  AS order_id_used,
+  SUM(uuid_new IS NOT NULL)  AS uuid_new_used,
+  SUM(parameters IS NOT NULL)  AS parameters_used,
+  SUM(result_data IS NOT NULL) AS result_data_used,
+  SUM(reassignment_history IS NOT NULL) AS reassignment_used,
+  SUM(suffix IS NOT NULL AND suffix <> '') AS suffix_used
+FROM worklists;
+
+SELECT SUM(sl_no IS NOT NULL) AS samples_sl_no_used FROM test_samples;
+
+SELECT
+  SUM(sample_number IS NOT NULL) AS items_sample_number_used
+FROM test_sample_items;
+
+-- 6) PHP-side leftover scan (project root):
+--    grep -rn --include=*.php -E "order_date|uuid_new|reassignment_history|sl_no" app/ database/ resources/
+--    grep -rn --include=*.php -E "'parameters'|'result_data'" app/
+--    grep -rn --include=*.php "sample_number" app/
+```
+
+---
+
+## 16. Post-migration verification SQL (`scripts/post_migration_verification.sql`)
+
+```sql
+-- 1) Dropped columns must be GONE (expect 0 rows)
+SELECT COLUMN_NAME
+FROM information_schema.columns
+WHERE table_schema = DATABASE() AND table_name = 'worklists'
+  AND COLUMN_NAME IN ('order_id','uuid_new','sample_number','order_date',
+                      'parameters','result_data','reassignment_history');
+
+-- 2) New columns must EXIST (expect 5 rows)
+SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+FROM information_schema.columns
+WHERE table_schema = DATABASE() AND table_name = 'worklists'
+  AND COLUMN_NAME IN ('machine_mapping_id','cancelled_reason','latest_result_id',
+                      'result_count','source')
+ORDER BY ORDINAL_POSITION;
+
+-- 3) Chain-table drops must be GONE (expect 0 rows total)
+SELECT table_name, COLUMN_NAME
+FROM information_schema.columns
+WHERE table_schema = DATABASE()
+  AND ((table_name = 'test_samples'      AND COLUMN_NAME = 'sl_no')
+    OR (table_name = 'test_sample_items' AND COLUMN_NAME = 'sample_number'));
+
+-- 4) New indexes exist
+SHOW INDEX FROM worklists
+WHERE Key_name IN ('uq_worklist_item_machine',
+                   'idx_worklist_machine_status_pushed',
+                   'idx_worklist_latest_result');
+
+-- 5) Old UNIQUE(order_id) must be gone (expect 0 rows)
+SHOW INDEX FROM worklists WHERE Column_name = 'order_id';
+
+-- 6) Kept columns still present (expect 3 rows)
+SELECT COLUMN_NAME
+FROM information_schema.columns
+WHERE table_schema = DATABASE() AND table_name = 'worklists'
+  AND COLUMN_NAME IN ('suffix','barcode','receipt_barcode');
+
+-- 6b) test_sample_items.suffix is KEPT — needed (expect 1 row)
+SELECT COLUMN_NAME
+FROM information_schema.columns
+WHERE table_schema = DATABASE() AND table_name = 'test_sample_items'
+  AND COLUMN_NAME = 'suffix';
+
+-- 7) Row counts identical to pre-check step 2
+SELECT
+  (SELECT COUNT(*) FROM worklists)         AS worklists_rows,
+  (SELECT COUNT(*) FROM test_samples)      AS test_samples_rows,
+  (SELECT COUNT(*) FROM test_sample_items) AS test_sample_items_rows;
+
+-- 8) worklist_reassignments exists (expect 1)
+SELECT COUNT(*) AS audit_table_exists
+FROM information_schema.tables
+WHERE table_schema = DATABASE() AND table_name = 'worklist_reassignments';
+
+-- 9) machine_mapping_id backfill state (NULL is OK — backfill when convenient)
+SELECT
+  (machine_mapping_id IS NULL) AS still_null,
+  COUNT(*) AS rows_count
+FROM worklists
+GROUP BY (machine_mapping_id IS NULL);
+```
+
+---
+
+## 17. Rollback
+
+```bash
+# structure only — data of the dropped columns is NOT restored
+php artisan migrate:rollback --step=1
+
+# rollback the CODE first if models are already patched (they reference new columns):
+git checkout main -- app/Models/Worklist.php app/Services/WorklistService.php
+
+# full data restore (3 tables, from the step-0 backup):
+mysql -u USER -p DBNAME < database/before_column_reduction.sql
+```
+
+Notes:
+- `down()` recreates every dropped column with its original type; `order_date` comes back as nullable (it was NOT NULL, but the table already holds rows).
+- `worklist_reassignments` is dropped by `down()` as well.
+- If you already inserted rows after the migration, the new columns (`machine_mapping_id`, `cancelled_reason`, `latest_result_id`, `result_count`, `source`) are removed by `down()` — those values are lost.
+
+---
+
+## 18. Optional — redundant single-column index cleanup
+
+These indexes are left-covered by composite indexes (existing + new). Dropping them saves write time on the hot insert path. **Run manually after the migration, in a quiet window; check real index names with `SHOW INDEX FROM worklists` first.**
+
+| Redundant index | Covered by (leftmost) | Statement |
+|---|---|---|
+| `machine_id` | `idx_worklist_machine_status_pushed` | `ALTER TABLE worklists DROP INDEX `machine_id`;` |
+| `pushed_at` | `idx_worklist_machine_status_pushed` | `ALTER TABLE worklists DROP INDEX `pushed_at`;` |
+| `barcode` | `(barcode, status)` | `ALTER TABLE worklists DROP INDEX `barcode`;` |
+| `test_sample_item_id` | `uq_worklist_item_machine` | `ALTER TABLE worklists DROP INDEX `test_sample_item_id`;` |
+| `lab_receipt_id` | `(lab_receipt_id, status)` | `ALTER TABLE worklists DROP INDEX `lab_receipt_id`;` |
+
+Also assess (low value, your call): `patient_name`, `tube_type`, `timing`, `receipt_barcode`. Keep `test_sample_id`, `test_id`, `patient_id`, `created_at`, `(status, priority)`.
+
+---
+
+## 19. FAQ
+
+**Q: The old draft `2026_11_17_000001_simplify_worklist_chain_columns.php` was already run — do I delete it?**
+A: `php artisan migrate:status` — if it shows "Ran", keep the file (Laravel needs it for rollback bookkeeping) and just add the new migration; the new one detects what already exists and only does the missing parts. If it was never run, delete the file.
+
+**Q: Why are BOTH `worklists.suffix` and `test_sample_items.suffix` kept?**
+A: `test_sample_items.suffix` is needed (confirmed — tube identity; the migration even re-adds it if the older 2026_11_17 draft already dropped it). `worklists.suffix` is kept for the Mirth OML payload (§1.7.7). Neither is in the drop list — don't add them.
+
+**Q: The old draft already dropped `test_sample_items.suffix` — is it gone forever?**
+A: The structure comes back: this migration's `up()` re-creates `suffix VARCHAR(20) NULL` when it is missing. Old values are not recoverable from the migration — restore them from `database/before_column_reduction.sql` if you need the data.
+
+**Q: Why `UNIQUE (test_sample_item_id, machine_id)` and not `(test_sample_id, test_id, machine_id)`?**
+A: The audit of `SampleController::recheckTest()` showed every recheck creates a NEW LabTest + NEW TestSampleItem, so `(test_sample_item_id, machine_id)` matches the existing duplicate guard with zero recheck-flow changes. If one tube item ever runs two different tests on the same analyzer, widen it to `['test_sample_item_id','test_id','machine_id']` — one line in the migration.
+
+**Q: The migration timestamp is older than my newest migration.**
+A: Rename the file prefix (e.g. `2026_12_01_000001_...php`) so it sorts after your latest migration — Laravel runs them in filename order.
+
+**Q: Does `down()` restore the dropped data?**
+A: No — structure only. Restore `database/before_column_reduction.sql` for data.
+
+**Q: Do tests break on SQLite?**
+A: The migration detects the driver (`sqlite` branch in the helpers) and the schema smoke test only asserts column existence — both work on MySQL and SQLite.
+
+---
+
+## Related docs
+
+- `worklist-lisresults-multi-version-design.md` — §1.4 (result pointer columns), §1.7 (this reduction's rationale), §2 (multi-version `lis_results`)
+- `unified-result-ingest-design.md` — one `ingestResult()` for Bidirectional + Unidirectional + Manual results, version at write time
+- `mirth-connect-bidirectional-worklist-guide_v5.md` — Pattern A (direct) and Pattern B (local cache) channel setup, HL7 + ASTM, online + offline (v5.2 — aligned with this guide's migration)

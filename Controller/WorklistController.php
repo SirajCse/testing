@@ -137,7 +137,7 @@ class WorklistController extends Controller
             $search = $request->search;
             $model->where(function ($q) use ($search) {
                 $q->where('worklists.barcode', 'like', "%{$search}%")
-                    ->orWhere('worklists.order_id', 'like', "%{$search}%")
+                    // REMOVED: orWhere('worklists.order_id', ...) — column dropped
                     ->orWhere('worklists.test_name', 'like', "%{$search}%")
                     ->orWhere('worklists.test_code', 'like', "%{$search}%")
                     ->orWhere('worklists.receipt_barcode', 'like', "%{$search}%")
@@ -196,9 +196,7 @@ class WorklistController extends Controller
                     case 'barcode':
                         $model->orderBy('worklists.barcode', $direction);
                         break;
-                    case 'order_id':
-                        $model->orderBy('worklists.order_id', $direction);
-                        break;
+                    // REMOVED: case 'order_id' — worklists.order_id column is dropped
                     case 'created_at':
                         $model->orderBy('worklists.created_at', $direction);
                         break;
@@ -304,7 +302,7 @@ class WorklistController extends Controller
             $search = $request->search;
             $query->where(function ($q) use ($search) {
                 $q->where('barcode', 'like', "%{$search}%")
-                    ->orWhere('order_id', 'like', "%{$search}%")
+                    // REMOVED: orWhere('order_id', ...) — column dropped
                     ->orWhere('test_name', 'like', "%{$search}%")
                     ->orWhere('patient_name', 'like', "%{$search}%")
                     ->orWhereHas('labReceipt', function ($rq) use ($search) {
@@ -524,8 +522,8 @@ class WorklistController extends Controller
                 'sample_info' => [
                     'barcode' => $worklist->testSample?->barcode,
                     'tube_type' => $worklist->testSample?->tube_type,
-                    'sample_number' => $worklist->sample_number,
-                    'suffix' => $worklist->suffix,
+                    'sample_number' => $worklist->testSample?->tube_sequence,   // CHANGED — worklists.sample_number dropped, derive from the tube
+                    'suffix' => $worklist->suffix,   // KEPT (needed)
                     'timing' => $worklist->timing,
                 ],
             ]);
@@ -925,7 +923,7 @@ class WorklistController extends Controller
         $callback = function () use ($worklists) {
             $file = fopen('php://output', 'w');
             fputcsv($file, [
-                'ID', 'Order ID', 'Barcode', 'Receipt Barcode', 'SL No',
+                'ID', 'Barcode', 'Receipt Barcode', 'SL No',
                 'Patient Name', 'Patient Age', 'Patient Gender',
                 'Test Name', 'Test Code', 'Sample Type', 'Tube Type', 'Timing',
                 'Machine', 'Priority', 'Status',
@@ -935,7 +933,6 @@ class WorklistController extends Controller
             foreach ($worklists as $worklist) {
                 fputcsv($file, [
                     $worklist->id,
-                    $worklist->order_id,
                     $worklist->barcode,
                     $worklist->receipt_barcode,
                     $worklist->sl_no,
@@ -998,7 +995,7 @@ class WorklistController extends Controller
         $callback = function () use ($worklists) {
             $file = fopen('php://output', 'w');
             fputcsv($file, [
-                'ID', 'Order ID', 'Barcode', 'Receipt Barcode', 'SL No',
+                'ID', 'Barcode', 'Receipt Barcode', 'SL No',
                 'Patient Name', 'Patient Age', 'Patient Gender',
                 'Test Name', 'Test Code', 'Sample Type', 'Tube Type', 'Timing',
                 'Machine', 'Priority', 'Status',
@@ -1008,7 +1005,6 @@ class WorklistController extends Controller
             foreach ($worklists as $worklist) {
                 fputcsv($file, [
                     $worklist->id,
-                    $worklist->order_id,
                     $worklist->barcode,
                     $worklist->receipt_barcode,
                     $worklist->sl_no,
@@ -1060,7 +1056,7 @@ class WorklistController extends Controller
 
         try {
             $data = $validator->validated();
-            $data['order_id'] = $this->worklistService->generateOrderId();
+            // REMOVED: $data['order_id'] = $this->worklistService->generateOrderId(); — column dropped
             $data['status'] = 'pending';
 
             $worklist = Worklist::create($data);
@@ -1107,11 +1103,11 @@ class WorklistController extends Controller
         $data = $worklists->map(function ($worklist) {
             return [
                 'worklist_id' => $worklist->id,
-                'order_id' => $worklist->order_id,
                 'barcode' => $worklist->barcode,
                 'receipt_barcode' => $worklist->receipt_barcode,
-                'sample_number' => $worklist->sample_number,
-                'suffix' => $worklist->suffix,
+                // REMOVED: 'order_id', 'sample_number' — columns dropped;
+                //          tube number comes from tube_sequence, suffix rides in receipt_barcode
+                'suffix' => $worklist->suffix,   // KEPT (needed)
                 'timing' => $worklist->timing,
                 'test_code' => $worklist->test_code,
                 'test_name' => $worklist->test_name,
@@ -1121,8 +1117,8 @@ class WorklistController extends Controller
                 'patient_name' => $worklist->patient_name ?? $worklist->labReceipt?->patient?->name,
                 'patient_age' => $worklist->patient_age ?? $worklist->labReceipt?->patient?->age,
                 'patient_gender' => $worklist->patient_gender ?? $worklist->labReceipt?->patient?->gender,
-                'order_date' => $worklist->order_date?->toISOString(),
                 'collection_date' => $worklist->collection_date?->toISOString(),
+                // REMOVED: 'order_date' => $worklist->order_date?->toISOString()
                 'tube_barcode' => $worklist->testSample?->barcode,
                 'tube_type' => $worklist->testSample?->tube_type,
             ];
@@ -1185,7 +1181,7 @@ class WorklistController extends Controller
         $validator = Validator::make($request->all(), [
             'barcode' => 'required|string',
             'machine_key' => 'required|string',
-            'result_data' => 'required|array',
+            // REMOVED: 'result_data' => 'required|array' — results live in lis_results
         ]);
 
         if ($validator->fails()) {
@@ -1203,7 +1199,7 @@ class WorklistController extends Controller
             return response()->json(['success' => false, 'message' => 'Worklist not found'], 404);
         }
 
-        $result = $this->worklistService->submitResult($worklist->id, $request->result_data);
+        $result = $this->worklistService->submitResult($worklist->id);
 
         if (!$result['success']) {
             return response()->json(['success' => false, 'message' => $result['message']], 400);
@@ -1290,7 +1286,6 @@ class WorklistController extends Controller
             'has_worklist' => true,
             'worklist' => [
                 'worklist_id' => $worklist->id,
-                'order_id' => $worklist->order_id,
                 'barcode' => $worklist->barcode,
                 'receipt_barcode' => $worklist->receipt_barcode,
                 'test_code' => $worklist->test_code,
@@ -1304,7 +1299,8 @@ class WorklistController extends Controller
                 'patient_age' => $worklist->patient_age,
                 'patient_gender' => $worklist->patient_gender,
                 'collection_date' => $worklist->collection_date?->toISOString(),
-                'parameters' => $worklist->parameters,
+                'machine_mapping_id' => $worklist->machine_mapping_id,   // NEW — replaces parameters
+                // REMOVED: 'order_id' and 'parameters' (columns dropped)
             ],
         ]);
     }
@@ -1365,7 +1361,7 @@ class WorklistController extends Controller
         $validator = Validator::make($request->all(), [
             'worklist_id' => 'required|string',
             'machine_key' => 'required|string',
-            'result_data' => 'required|array',
+            // REMOVED: 'result_data' => 'required|array' — results live in lis_results
         ]);
 
         if ($validator->fails()) {
@@ -1387,8 +1383,7 @@ class WorklistController extends Controller
         }
 
         $result = $this->worklistService->submitResult(
-            $request->worklist_id,
-            $request->result_data
+            $request->worklist_id
         );
 
         if (!$result['success']) {
@@ -1484,8 +1479,8 @@ class WorklistController extends Controller
             'worklists' => $worklists->map(function ($worklist) {
                 return [
                     'worklist_id' => $worklist->id,
-                    'order_id' => $worklist->order_id,
                     'barcode' => $worklist->barcode,
+                    // REMOVED: 'order_id' — column dropped
                     'test_code' => $worklist->test_code,
                     'test_name' => $worklist->test_name,
                     'priority' => $worklist->priority,

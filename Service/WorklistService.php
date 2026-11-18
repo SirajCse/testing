@@ -54,7 +54,7 @@ class WorklistService
             'test',
         ])
             ->whereHas('testSample', fn ($q) => $q->where('lab_receipt_id', $labReceiptId))
-            ->where('is_collected', true)
+            ->whereNotNull('collected_by')   // FIXED: was ->where('is_collected', true) — that is an accessor, not a DB column
             ->get();
 
         if ($items->isEmpty()) {
@@ -78,16 +78,15 @@ class WorklistService
     }
 
     /**
-     * Create worklist for a single test - WITH DEBUG
-     */
-    /**
      * Create worklist for a single test - WITH FIXES
      *
      * Fixes applied:
      * - Resolves test_id with fallback chain (item → labTest)
      * - Loud logging when things fail
-     * - Populates sample_number, suffix, test_sample_id
-     * - Merges full mapping params into worklist.parameters
+     * - Populates test_sample_id
+     * - Column reduction 2026-11-18: no more order_date/parameters/sample_number
+     *   writes — machine_mapping_id is a native column, mapping params are fetched
+     *   by Mirth via GET /api/mirth/machine-config/{device_model} (cached per channel)
      */
     public function createWorklistForTest(TestSampleItem $item): array
     {
@@ -132,21 +131,12 @@ class WorklistService
             return [];
         }
 
-        // ── 🟢 GLUE FIX: resolve sample_number / suffix / barcode ──
-        $barcode      = $testSample->barcode;
-        $tubeType     = $testSample->tube_type;
-        $tubeSequence = $testSample->tube_sequence;
-
-        // sample_number: item → tube_sequence → parse from barcode → 1
-        $sampleNumber = $item->sample_number
-            ?? $tubeSequence
-            ?? $this->extractSampleNumberFromBarcode($barcode)
-            ?? 1;
-
-        // suffix: item → tube timing → parse from barcode
-        $suffix = $item->suffix
-            ?? $testSample->timing
-            ?? $this->extractSuffixFromBarcode($barcode);
+        // ── resolve barcode / tube basics (column reduction 2026-11-18) ──
+        // worklists.sample_number is DROPPED → tube number = test_samples.tube_sequence.
+        // test_sample_items.suffix is KEPT (needed) but the worklist create no longer
+        // writes sample_number / suffix / parameters — Mirth resolves the tube by barcode.
+        $barcode  = $testSample->barcode;
+        $tubeType = $testSample->tube_type;
 
         $labReceipt = $testSample->labReceipt;
         $patient    = $labReceipt?->patient;
@@ -178,26 +168,8 @@ class WorklistService
 
             $status = $isCompleted ? self::STATUS_LOCKED : self::STATUS_PENDING;
 
-            // Decode mapping params safely
-            $mappingParams = $this->decodeParams($mapping->parameters);
-
-            // 🟢 Build the parameter bag — this is what Mirth / the analyzer sees
-            $parameters = array_merge([
-                'machine_mapping_id' => $mapping->id,
-                'tube_barcode'       => $barcode,
-                'tube_type'          => $tubeType,
-                'tube_sequence'      => $tubeSequence,
-                'timing'             => $testSample->timing,
-                'test_code_mapped'   => $mapping->test_code,
-                'original_test_id'   => $testId,
-                'sample_number'      => $sampleNumber,
-                'suffix'             => $suffix,
-
-                // 🟢 GLUE guards — self-describing payload
-                'barcode'            => $barcode,
-                'sample_id'          => $barcode,                  // HL7 OBX-3 alias
-                'unique_sample_key'  => $barcode.'|'.$testId,      // cross-tube discriminator
-            ], $mappingParams);
+            // Mapping params are NOT embedded anymore — Mirth fetches them once via
+            // GET /api/mirth/machine-config/{device_model} and caches per channel start.
 
             try {
                 $worklist = Worklist::create([
@@ -206,13 +178,12 @@ class WorklistService
                     'lab_test_id'         => $labTest->id,
                     'test_id'             => $testId,
                     'machine_id'          => $machine->id,
+                    'machine_mapping_id'  => $mapping->id,   // NEW — machine_test_mappings(id) (was inside parameters JSON)
                     'patient_id'          => $patient?->id,
 
                     'barcode'             => $barcode,
                     'receipt_barcode'     => $labReceipt?->barcode,
 
-                    'sample_number'       => $sampleNumber,
-                    'suffix'              => $suffix,
                     'test_sample_id'      => $testSample->id,
 
                     'patient_name'        => $patient?->name,
@@ -231,10 +202,10 @@ class WorklistService
 
                     'priority'            => $this->determinePriority($labReceipt, $machine),
                     'status'              => $status,
-                    'order_date'          => $labReceipt?->created_at ?? now(),
                     'collection_date'     => $testSample->collected_at ?? now(),
-
-                    'parameters'          => $parameters,
+                    'source'              => 'fanout',
+                    // REMOVED: order_date, parameters, sample_number
+                    //          (suffix column kept, not written here — rides in receipt_barcode)
                 ]);
 
                 Log::info('WORKLIST CREATED', [
@@ -244,8 +215,6 @@ class WorklistService
                     'machine_name'  => $machine->display_name,
                     'test_name'     => $labTest->test?->name,
                     'barcode'       => $barcode,
-                    'sample_number' => $sampleNumber,
-                    'suffix'        => $suffix,
                     'status'        => $status,
                 ]);
 
@@ -307,12 +276,8 @@ class WorklistService
                 return ['success' => false, 'message' => 'No machine configured for this test'];
             }
 
-            // Get sample number from existing sample items
-            $sampleNumber = 1;
-            $sampleItem = $labTest->sampleItems->first();
-            if ($sampleItem) {
-                $sampleNumber = $sampleItem->sample_number;
-            }
+            // Tube number — test_sample_items.sample_number is DROPPED; use the tube's sequence
+            $sampleNumber = $labTest->sampleItems->first()?->testSample?->tube_sequence ?? 1;
 
             $machine = $machineConfig->machine;
 
@@ -367,20 +332,17 @@ class WorklistService
 
                 'priority' => self::PRIORITY_HIGH,
                 'status' => self::STATUS_PENDING,
-                'order_date' => $labTest->receipt->created_at ?? now(),
                 'collection_date' => now(),
-                'parameters' => [
-                    'is_recheck' => true,
-                    'recheck_reason' => $reason,
-                    'original_test_id' => $labTest->retest_of ?? $labTest->id,
-                    'recheck_type' => 'new_sample',
-                ],
+                'source' => 'recheck',   // NEW — was parameters.is_recheck (parameters column dropped)
+                // REMOVED: order_date, parameters (is_recheck/recheck_reason/original_test_id/recheck_type)
             ]);
 
             Log::info('Recheck worklist created', [
                 'lab_test_id' => $labTestId,
                 'barcode' => $barcode,
                 'worklist_id' => $worklist->id,
+                'recheck_reason' => $reason,
+                'original_test_id' => $labTest->retest_of ?? $labTest->id,
             ]);
 
             return ['success' => true, 'worklist' => $worklist];
@@ -537,7 +499,7 @@ class WorklistService
     /**
      * Submit result for a worklist
      */
-    public function submitResult(string $worklistId, array $resultData): array
+    public function submitResult(string $worklistId): array
     {
         $worklist = Worklist::find($worklistId);
         if (! $worklist) {
@@ -548,7 +510,7 @@ class WorklistService
             return ['success' => false, 'message' => 'Test already completed'];
         }
 
-        if ($worklist->markAsCompleted($resultData)) {
+        if ($worklist->markAsCompleted()) {   // no $resultData — the result lives in lis_results
             // Update TestSampleItem
             if ($worklist->test_sample_item_id) {
                 TestSampleItem::where('id', $worklist->test_sample_item_id)
@@ -647,7 +609,7 @@ class WorklistService
     /**
      * Update worklist status (simple wrapper)
      */
-    public function updateWorklistStatus(string $worklistId, string $status, ?array $resultData = null): bool
+    public function updateWorklistStatus(string $worklistId, string $status): bool
     {
         $worklist = Worklist::find($worklistId);
         if (! $worklist) {
@@ -655,9 +617,7 @@ class WorklistService
         }
 
         $worklist->status = $status;
-        if ($resultData) {
-            $worklist->result_data = $resultData;
-        }
+        // REMOVED: if ($resultData) { $worklist->result_data = $resultData; } — column dropped
         if ($status === self::STATUS_COMPLETED) {
             $worklist->completed_at = now();
         }
@@ -696,21 +656,23 @@ class WorklistService
 
             $oldMachineId = $worklist->machine_id;
 
-            // Update test_code to match new machine's mapping
+            // Update mapping + test_code to match the new machine
             $worklist->machine_id = $newMachineId;
+            $worklist->machine_mapping_id = $machineConfig->id;   // NEW — was inside parameters JSON
             $worklist->test_code = $machineConfig->test_code ?? $worklist->test_code;
-
-            // Track reassignment history
-            $history = $worklist->reassignment_history ?? [];
-            $history[] = [
-                'from_machine' => $oldMachineId,
-                'to_machine' => $newMachineId,
-                'reason' => $reason,
-                'reassigned_at' => now()->toISOString(),
-            ];
-            $worklist->reassignment_history = $history;
-
             $worklist->save();
+
+            // Audit moved to the dedicated worklist_reassignments table
+            // (replaces the dropped reassignment_history JSON — §1.7.3)
+            \DB::table('worklist_reassignments')->insert([
+                'id' => (string) \Illuminate\Support\Str::uuid7(),
+                'worklist_id' => $worklistId,
+                'from_machine_id' => $oldMachineId,
+                'to_machine_id' => $newMachineId,
+                'reason' => $reason,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
 
             Log::info('Worklist reassigned', [
                 'worklist_id' => $worklistId,
@@ -1141,13 +1103,7 @@ class WorklistService
     // HELPER METHODS
     // ============================================
 
-    /**
-     * Generate unique order ID
-     */
-    public function generateOrderId(): string
-    {
-        return 'WL'.now()->format('ymd').strtoupper(substr(uniqid(), -6));
-    }
+    // REMOVED: generateOrderId() — worklists.order_id column is dropped
 
     /**
      * Determine priority for worklist
@@ -1307,48 +1263,10 @@ class WorklistService
     }
 
     /**
-     * Extract suffix from barcode like "2610161002-F" → "F"
-     * Also handles "2610161002-2H", "2610161002-PP", "2610161002-C1"
+     * REMOVED helpers (dead after the column reduction):
+     * - extractSuffixFromBarcode()  — only fed the removed worklist suffix write
+     * - extractSampleNumberFromBarcode() — only fed the removed sample_number write
+     * - decodeParams() — mapping params are no longer embedded; Mirth fetches
+     *   them via GET /api/mirth/machine-config/{device_model}
      */
-    private function extractSuffixFromBarcode(?string $barcode): ?string
-    {
-        if (! $barcode) {
-            return null;
-        }
-        if (preg_match('/-([A-Z0-9]+)$/i', $barcode, $m)) {
-            return strtoupper($m[1]);
-        }
-        return null;
-    }
-
-    /**
-     * Extract sample number from barcode if encoded (e.g. "...#02" → 2)
-     */
-    private function extractSampleNumberFromBarcode(?string $barcode): ?int
-    {
-        if (! $barcode) {
-            return null;
-        }
-        if (preg_match('/#(\d+)/', $barcode, $m)) {
-            return (int) $m[1];
-        }
-        return null;
-    }
-
-    /**
-     * Safely decode mapping parameters (array | json string | null)
-     */
-    private function decodeParams($raw): array
-    {
-        if (is_array($raw)) {
-            return $raw;
-        }
-        if (is_string($raw)) {
-            $decoded = json_decode($raw, true);
-            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
-                return $decoded;
-            }
-        }
-        return [];
-    }
 }
