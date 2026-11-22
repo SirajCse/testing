@@ -32,21 +32,21 @@ class MachineConfigController extends Controller
             ->with('test:id,code,name,short_name,sample_type')
             ->get()
             ->map(fn ($m) => [
-                'id'                => $m->id,
-                'test_id'           => $m->test_id,
-                'test_code'         => $m->test_code,
-                'test_name'         => $m->test?->name,
-                'sample_type'       => $m->sample_type,
-                'parameters'        => is_string($m->parameters)
+                'id' => $m->id,
+                'test_id' => $m->test_id,
+                'test_code' => $m->test_code,
+                'test_name' => $m->test?->name,
+                'sample_type' => $m->sample_type,
+                'parameters' => is_string($m->parameters)
                     ? json_decode($m->parameters, true)
                     : ($m->parameters ?? []),
             ]);
 
         return response()->json([
-            'success'          => true,
-            'machine_id'       => $machine->id,
-            'device_model'     => $machine->device_model,
-            'direction'        => $machine->direction ?? 'unidirectional',
+            'success' => true,
+            'machine_id' => $machine->id,
+            'device_model' => $machine->device_model,
+            'direction' => $machine->direction ?? 'unidirectional',
             'machine_mappings' => $mappings,
         ]);
     }

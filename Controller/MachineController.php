@@ -77,7 +77,7 @@ class MachineController extends Controller
             'protocol' => 'nullable|string',
             'protocol_version' => 'nullable|string',
             'auto_push_enabled' => 'nullable|boolean',
-            'auto_push_direction' => 'nullable|string',
+            'direction' => 'nullable|string',
             'is_active' => 'nullable|boolean',
             'priority' => 'nullable|integer|min:0|max:100',
             'api_key' => 'nullable|string',
@@ -154,7 +154,7 @@ class MachineController extends Controller
             'protocol' => 'nullable|string',
             'protocol_version' => 'nullable|string',
             'auto_push_enabled' => 'nullable|boolean',
-            'auto_push_direction' => 'nullable|string',
+            'direction' => 'nullable|string',
             'is_active' => 'nullable|boolean',
             'priority' => 'nullable|integer|min:0|max:100',
             'api_key' => 'nullable|string',
@@ -1509,28 +1509,38 @@ class MachineController extends Controller
      */
     public function getTestDefaultParameters($machineId, $testId)
     {
-        $test = Test::with('components')->findOrFail($testId);
+        $tenantId = auth()->user()->tenant_id;
+
+        $test = Test::with([
+            'components' => function ($q) use ($tenantId) {
+                $q->select('id', 'test_id', 'name', 'type', 'unit', 'order', 'hide')
+                    ->with([
+                        'override' => fn ($o) => $o->where('tenant_id', $tenantId),
+                    ]);
+            },
+        ])->findOrFail($testId);
+
         $machine = Machine::findOrFail($machineId);
 
         $components = [];
-        $mapping = []; // code => component_id mapping
-        $isMultiComponent = $test->components->count() > 1 ||
-            $test->components->contains('is_opinion', true);
+        $mapping = [];
 
         foreach ($test->components as $component) {
-            // Determine mapping key: use code if available, otherwise slugified name
-            $mapKey = ! empty($component->code)
-                ? $component->code
-                : Str::slug($component->name, '_');
+
+            // Respect tenant override: status = 0 (disabled) or hide = 1 (hidden)
+            if ($component->isHiddenForTenant()) {
+                continue;
+            }
+
+            $mapKey = ! empty($component->code) ? $component->code : Str::slug($component->name, '_');
 
             $mapping[$mapKey] = $component->id;
 
-            // Build component array – include ID and set code to match mapping key
             $comp = [
                 'id' => $component->id,
                 'name' => $component->name,
-                'code' => $mapKey, // ✅ Now matches the mapping key
-                'unit' => $component->unit,
+                'code' => $mapKey,
+                'unit' => $component->resolvedUnit() ?? $component->unit,
                 'ref_range' => $component->ref_range,
                 'decimal_places' => $component->decimal_places ?? 2,
                 'order' => $component->order,
@@ -1571,11 +1581,11 @@ class MachineController extends Controller
                         'name' => 'opinion_range',
                         'params' => [
                             'ranges' => [
-                                ['min' => $maxNorm * 2.5, 'max' => 999999, 'text' => 'Very High'],
-                                ['min' => $maxNorm, 'max' => $maxNorm * 2.49, 'text' => 'High'],
-                                ['min' => $minNorm, 'max' => $maxNorm, 'text' => 'Normal'],
-                                ['min' => $minNorm * 0.5, 'max' => $minNorm, 'text' => 'Low'],
-                                ['min' => 0, 'max' => $minNorm * 0.49, 'text' => 'Very Low'],
+                                ['min' => $maxNorm * 2.5,  'max' => 999999,          'text' => 'Very High'],
+                                ['min' => $maxNorm,        'max' => $maxNorm * 2.49,  'text' => 'High'],
+                                ['min' => $minNorm,        'max' => $maxNorm,         'text' => 'Normal'],
+                                ['min' => $minNorm * 0.5,  'max' => $minNorm,         'text' => 'Low'],
+                                ['min' => 0,               'max' => $minNorm * 0.49,  'text' => 'Very Low'],
                             ],
                         ],
                     ];
@@ -1592,6 +1602,9 @@ class MachineController extends Controller
 
             $components[] = $comp;
         }
+
+        $isMultiComponent = count($components) > 1
+            || collect($components)->contains(fn ($c) => ! empty($c['is_opinion']));
 
         // Build final parameters array
         $parameters = [
